@@ -2,15 +2,17 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
-$RuntimeNode = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
-$ViteBin = Join-Path (Get-Location) "node_modules\vite\bin\vite.js"
+function Resolve-Npm {
+  $Npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+  if ($Npm) { return $Npm.Source }
 
-if (-not (Test-Path $RuntimeNode)) {
-  throw "Bundled Node was not found at $RuntimeNode. Install Node.js 20+ or run inside Codex Desktop."
+  $LocalNpm = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "Programs\nodejs") -Filter "npm.cmd" -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($LocalNpm) { return $LocalNpm.FullName }
+
+  throw "npm was not found. Install Node.js 20+ from https://nodejs.org/en/download and reopen PowerShell."
 }
 
-if (-not (Test-Path $ViteBin)) {
-  throw "Dependencies are not installed. Run .\scripts\install-deps.ps1 first."
-}
-
-& $RuntimeNode $ViteBin build
+$Npm = Resolve-Npm
+& $Npm run build

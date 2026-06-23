@@ -2,15 +2,17 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
-$RuntimeNode = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
-$NpmCli = "C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js"
+function Resolve-Npm {
+  $Npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+  if ($Npm) { return $Npm.Source }
 
-if (-not (Test-Path $RuntimeNode)) {
-  throw "Bundled Node was not found at $RuntimeNode. Install Node.js 20+ or run inside Codex Desktop."
+  $LocalNpm = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "Programs\nodejs") -Filter "npm.cmd" -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($LocalNpm) { return $LocalNpm.FullName }
+
+  throw "npm was not found. Install Node.js 20+ from https://nodejs.org/en/download and reopen PowerShell."
 }
 
-if (-not (Test-Path $NpmCli)) {
-  throw "npm was not found at $NpmCli. Install Node.js 20+ from https://nodejs.org/en/download and reopen PowerShell."
-}
-
-& $RuntimeNode $NpmCli install
+$Npm = Resolve-Npm
+& $Npm install
