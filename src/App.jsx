@@ -9,7 +9,6 @@ import {
   FileDown,
   Filter,
   Grid2X2,
-  Import,
   Inbox,
   Library,
   Link as LinkIcon,
@@ -18,15 +17,14 @@ import {
   MoreHorizontal,
   Play,
   Search,
-  Settings,
   ShieldCheck,
   Sparkles,
   Tags,
+  Trash2,
   UploadCloud,
   UserRound,
   X
 } from "lucide-react";
-import { sampleItems } from "./data/sampleItems.js";
 import { enrichItem, readProviderHealth } from "./lib/aiClient.js";
 import { parseImportFiles } from "./lib/instagramImport.js";
 import {
@@ -57,8 +55,12 @@ export default function App() {
   const [layout, setLayout] = useState("grid");
   const [activeTab, setActiveTab] = useState("AI Summary");
   const [toast, setToast] = useState("");
+  const [pendingImport, setPendingImport] = useState(null);
+  const [importSelection, setImportSelection] = useState({ saved: true, other: true, messages: [] });
   const [loading, setLoading] = useState(true);
   const [dragging, setDragging] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarHovered, setSidebarHovered] = useState(false);
   const [provider, setProvider] = useState({ provider: "Local rules", configured: false });
   const fileInputRef = useRef(null);
   const addLinkRef = useRef(null);
@@ -72,22 +74,27 @@ export default function App() {
         if (!nextItems.length) {
           nextItems = normalizeItems(readLegacyLocalItems());
         }
-        if (!nextItems.length) {
-          nextItems = normalizeItems(sampleItems);
+        const withoutSeedItems = nextItems.filter((item) => !String(item.id || "").startsWith("sample-"));
+        if (withoutSeedItems.length !== nextItems.length) {
+          nextItems = withoutSeedItems;
+          await replaceItems(nextItems);
         }
-        await putItems(nextItems);
+        if (nextItems.length) await putItems(nextItems);
         if (!active) return;
         setItems(nextItems);
         setBatches(storedBatches);
         setSelectedId(nextItems[0]?.id || null);
         setProvider(health);
+        const resumeQueue = nextItems.filter((item) => item.status === "needs_review" || ["pending", "analyzing", "error"].includes(item.aiStatus));
+        if (resumeQueue.length) {
+          window.setTimeout(() => runEnrichment(resumeQueue), 350);
+        }
       } catch (error) {
-        const fallbackItems = normalizeItems(sampleItems);
         if (!active) return;
-        setItems(fallbackItems);
-        setSelectedId(fallbackItems[0]?.id || null);
+        setItems([]);
+        setSelectedId(null);
         setProvider({ provider: "Local rules", configured: false });
-        showToast(`Loaded sample library: ${error.message}`);
+        showToast(`Storage check failed: ${error.message}`);
       } finally {
         if (active) setLoading(false);
       }
@@ -99,7 +106,7 @@ export default function App() {
   }, []);
 
   const visibleItems = useMemo(() => filterItems(items, filters), [items, filters]);
-  const selectedItem = items.find((item) => item.id === selectedId) || visibleItems[0] || items[0] || null;
+  const selectedItem = selectedId ? items.find((item) => item.id === selectedId) || null : null;
   const selectedCategory = filters.category;
   const stats = useMemo(() => getStats(items), [items]);
   const categories = useMemo(() => getCategoryCounts(items), [items]);
@@ -128,15 +135,17 @@ export default function App() {
     setLoading(true);
     try {
       const result = await parseImportFiles(files);
-      const nextItems = mergeItems(items, result.items);
-      await putItems(nextItems);
-      await addBatch(result.batch);
-      setItems(nextItems);
-      setBatches((current) => [result.batch, ...current]);
-      setSelectedId(result.items[0]?.id || nextItems[0]?.id || null);
-      setFilters((current) => ({ ...current, source: "all", category: "All" }));
-      showToast(`Imported ${result.items.length} reels from ${result.batch.documentCount} JSON files.`);
-      void runEnrichment(result.items);
+      if (!result.items.length) {
+        showToast("No Instagram reels found in that export.");
+        return;
+      }
+      setPendingImport(result);
+      setImportSelection({
+        saved: result.groups.saved.count > 0,
+        other: result.groups.other.count > 0,
+        messages: result.groups.messages.map((group) => group.account)
+      });
+      showToast(`Found ${result.items.length} reels. Choose what to import.`);
     } catch (error) {
       showToast(`Import failed: ${error.message}`);
     } finally {
@@ -145,11 +154,64 @@ export default function App() {
     }
   };
 
+  const selectedImportItems = useMemo(() => {
+    if (!pendingImport) return [];
+    return filterPendingImportItems(pendingImport, importSelection);
+  }, [pendingImport, importSelection]);
+
+  const commitPendingImport = async () => {
+    if (!pendingImport) return;
+    if (!selectedImportItems.length) {
+      showToast("Choose at least one saved group or message person first.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const nextItems = mergeItems(items, selectedImportItems);
+      const batch = {
+        ...pendingImport.batch,
+        itemCount: selectedImportItems.length,
+        selectedSaved: importSelection.saved,
+        selectedOther: importSelection.other,
+        selectedMessages: importSelection.messages
+      };
+      await putItems(nextItems);
+      await addBatch(batch);
+      setItems(nextItems);
+      setBatches((current) => [batch, ...current]);
+      setSelectedId(selectedImportItems[0]?.id || nextItems[0]?.id || null);
+      setFilters((current) => ({ ...current, source: "all", category: "All" }));
+      setPendingImport(null);
+      showToast(`Imported ${selectedImportItems.length} reels. AI review started.`);
+      void runEnrichment(selectedImportItems);
+    } catch (error) {
+      showToast(`Import failed: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const cancelPendingImport = () => {
+    setPendingImport(null);
+    setImportSelection({ saved: true, other: true, messages: [] });
+  };
+
+  const toggleMessageImport = (account) => {
+    setImportSelection((current) => ({
+      ...current,
+      messages: current.messages.includes(account)
+        ? current.messages.filter((entry) => entry !== account)
+        : [...current.messages, account]
+    }));
+  };
+
   const runEnrichment = async (queue, mode = "text") => {
     for (const item of queue) {
-      patchItem(item.id, { aiStatus: "analyzing", status: item.status === "reviewed" ? "reviewed" : "needs_review" });
+      const analyzingItem = { ...item, aiStatus: "analyzing", status: item.status === "reviewed" ? "reviewed" : "needs_review" };
+      patchItem(item.id, analyzingItem);
+      await updateItem(analyzingItem);
       try {
-        const result = await enrichItem(item, mode);
+        const result = await enrichItem(analyzingItem, mode);
         patchItem(item.id, {
           title: result.title || item.title,
           category: result.category || item.category,
@@ -196,29 +258,28 @@ export default function App() {
   };
 
   const handleClear = async () => {
-    const confirmed = window.confirm("Clear this browser library? Export JSON first if you need a backup.");
+    const confirmed = window.confirm("Reset this browser library and remove every imported reel? Export JSON first if you need a backup.");
     if (!confirmed) return;
     await clearLibrary();
-    const seeds = normalizeItems(sampleItems);
-    await putItems(seeds);
-    setItems(seeds);
+    setItems([]);
     setBatches([]);
-    setSelectedId(seeds[0]?.id || null);
-    showToast("Library reset to sample reels.");
+    setSelectedId(null);
+    showToast("Library reset.");
   };
 
   if (loading && !items.length) {
-    return (
-      <div className="loading-screen">
-        <Loader2 className="spin" size={28} />
-        <span>Loading AI Reels Library</span>
-      </div>
-    );
+    return <LoadingScreen />;
   }
 
   return (
     <div
-      className={`reel-app ${dragging ? "dragging" : ""}`}
+      className={[
+        "reel-app",
+        dragging ? "dragging" : "",
+        sidebarCollapsed ? "sidebar-collapsed" : "",
+        sidebarCollapsed && sidebarHovered ? "sidebar-hovered" : "",
+        selectedItem ? "has-detail" : "detail-closed"
+      ].filter(Boolean).join(" ")}
       onDragOver={(event) => {
         event.preventDefault();
         setDragging(true);
@@ -242,6 +303,14 @@ export default function App() {
       <Sidebar
         stats={stats}
         active={filters.source}
+        collapsed={sidebarCollapsed}
+        hoverExpanded={sidebarCollapsed && sidebarHovered}
+        onHoverStart={() => setSidebarHovered(true)}
+        onHoverEnd={() => setSidebarHovered(false)}
+        onToggleCollapsed={() => {
+          setSidebarHovered(false);
+          setSidebarCollapsed((current) => !current);
+        }}
         onSourceChange={(source) => setFilters((current) => ({ ...current, source }))}
         onExportJson={() => exportJson(items)}
         onExportMarkdown={() => exportMarkdown(visibleItems)}
@@ -249,7 +318,8 @@ export default function App() {
         onClear={handleClear}
       />
 
-      <main className="catalog-main">
+      <main className={`catalog-main ${loading ? "is-loading" : ""}`} aria-busy={loading}>
+        {loading ? <LoadingVeil /> : null}
         <Topbar
           search={filters.search}
           provider={provider}
@@ -277,10 +347,14 @@ export default function App() {
               ))}
             </div>
           ) : (
-            <EmptyState onImport={() => fileInputRef.current?.click()} />
+            <EmptyState hasItems={items.length > 0} onImport={() => fileInputRef.current?.click()} />
           )
         ) : (
-          <ReelList items={visibleItems} selectedId={selectedItem?.id} onSelect={setSelectedId} />
+          visibleItems.length ? (
+            <ReelList items={visibleItems} selectedId={selectedItem?.id} onSelect={setSelectedId} />
+          ) : (
+            <EmptyState hasItems={items.length > 0} onImport={() => fileInputRef.current?.click()} />
+          )
         )}
       </main>
 
@@ -337,13 +411,67 @@ export default function App() {
         </form>
       </dialog>
 
+      {pendingImport ? (
+        <ImportReviewLayer
+          pendingImport={pendingImport}
+          selection={importSelection}
+          selectedCount={selectedImportItems.length}
+          onToggleSaved={() => setImportSelection((current) => ({ ...current, saved: !current.saved }))}
+          onToggleOther={() => setImportSelection((current) => ({ ...current, other: !current.other }))}
+          onToggleMessage={toggleMessageImport}
+          onCancel={cancelPendingImport}
+          onContinue={commitPendingImport}
+        />
+      ) : null}
       {dragging ? <div className="drop-overlay">Drop Instagram ZIP or JSON to import</div> : null}
       {toast ? <div className="toast">{toast}</div> : null}
     </div>
   );
 }
 
-function Sidebar({ stats, active, onSourceChange, onExportJson, onExportMarkdown, onAddLink, onClear }) {
+function LoadingScreen() {
+  return (
+    <div className="loading-screen">
+      <div className="loading-orb">
+        <Loader2 className="spin" size={28} />
+      </div>
+      <div>
+        <strong>Loading AI Reels Library</strong>
+        <span>Preparing your local library</span>
+      </div>
+      <div className="loading-skeleton" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
+    </div>
+  );
+}
+
+function LoadingVeil() {
+  return (
+    <div className="loading-veil" aria-hidden="true">
+      <Loader2 className="spin" size={22} />
+      <span>Reading import and updating library...</span>
+    </div>
+  );
+}
+
+function Sidebar({
+  stats,
+  active,
+  collapsed,
+  hoverExpanded,
+  onHoverStart,
+  onHoverEnd,
+  onToggleCollapsed,
+  onSourceChange,
+  onExportJson,
+  onExportMarkdown,
+  onAddLink,
+  onClear
+}) {
+  const visuallyCollapsed = collapsed && !hoverExpanded;
   const nav = [
     { id: "all", label: "Library", count: stats.total, icon: Library },
     { id: "saved", label: "Saved Reels", count: stats.saved, icon: Bookmark },
@@ -352,10 +480,23 @@ function Sidebar({ stats, active, onSourceChange, onExportJson, onExportMarkdown
   ];
 
   return (
-    <aside className="side-nav">
+    <aside
+      className={`side-nav ${visuallyCollapsed ? "collapsed" : ""} ${hoverExpanded ? "hover-expanded" : ""}`}
+      onPointerEnter={collapsed ? onHoverStart : undefined}
+      onPointerLeave={collapsed ? onHoverEnd : undefined}
+      onMouseEnter={collapsed ? onHoverStart : undefined}
+      onMouseLeave={collapsed ? onHoverEnd : undefined}
+    >
       <div className="brand-row">
         <div className="brand-title">AI Reels Library</div>
-        <button className="icon-button subtle" type="button" aria-label="Menu">
+        <button
+          className="icon-button subtle collapse-toggle"
+          type="button"
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!collapsed}
+          onClick={onToggleCollapsed}
+          title={visuallyCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
           <List size={19} />
         </button>
       </div>
@@ -364,7 +505,14 @@ function Sidebar({ stats, active, onSourceChange, onExportJson, onExportMarkdown
         {nav.map((entry) => {
           const Icon = entry.icon;
           return (
-            <button key={entry.id} className={`nav-item ${active === entry.id ? "active" : ""}`} type="button" onClick={() => onSourceChange(entry.id)}>
+            <button
+              key={entry.id}
+              className={`nav-item ${active === entry.id ? "active" : ""}`}
+              type="button"
+              aria-label={`${entry.label}: ${entry.count}`}
+              title={visuallyCollapsed ? entry.label : undefined}
+              onClick={() => onSourceChange(entry.id)}
+            >
               <Icon size={18} />
               <span>{entry.label}</span>
               <strong>{entry.count}</strong>
@@ -374,21 +522,21 @@ function Sidebar({ stats, active, onSourceChange, onExportJson, onExportMarkdown
       </nav>
 
       <div className="nav-group quiet">
-        <button className="nav-item" type="button" onClick={onAddLink}>
+        <button className="nav-item" type="button" aria-label="Add link" title={visuallyCollapsed ? "Add Link" : undefined} onClick={onAddLink}>
           <LinkIcon size={18} />
           <span>Add Link</span>
         </button>
-        <button className="nav-item" type="button" onClick={onExportJson}>
+        <button className="nav-item" type="button" aria-label="Export JSON" title={visuallyCollapsed ? "Export JSON" : undefined} onClick={onExportJson}>
           <Download size={18} />
           <span>Export JSON</span>
         </button>
-        <button className="nav-item" type="button" onClick={onExportMarkdown}>
+        <button className="nav-item" type="button" aria-label="Export Markdown" title={visuallyCollapsed ? "Export Markdown" : undefined} onClick={onExportMarkdown}>
           <FileDown size={18} />
           <span>Export Markdown</span>
         </button>
-        <button className="nav-item" type="button" onClick={onClear}>
-          <Settings size={18} />
-          <span>Reset Sample</span>
+        <button className="nav-item danger" type="button" aria-label="Reset library" title={visuallyCollapsed ? "Reset Library" : undefined} onClick={onClear}>
+          <Trash2 size={18} />
+          <span>Reset Library</span>
         </button>
       </div>
 
@@ -435,7 +583,7 @@ function ImportStatus({ latestBatch, stats, onImport }) {
     <section className="import-strip">
       <div>
         <span>Latest Import</span>
-        <strong>{latestBatch ? formatDate(latestBatch.importedAt) : "Sample library loaded"}</strong>
+        <strong>{latestBatch ? formatDate(latestBatch.importedAt) : "No import yet"}</strong>
       </div>
       <StatusMetric icon={CheckCircle2} label="Imported" value={stats.total.toLocaleString()} />
       <StatusMetric icon={Loader2} label="Analyzing" value={stats.analyzing} spinning={stats.analyzing > 0} />
@@ -542,11 +690,7 @@ function ReelList({ items, selectedId, onSelect }) {
 
 function DetailPanel({ item, activeTab, onTab, onClose, onReprocess, onMarkReviewed }) {
   if (!item) {
-    return (
-      <aside className="detail-drawer empty">
-        <p>Select a reel to inspect summary, steps, caption, and embed.</p>
-      </aside>
-    );
+    return <aside className="detail-drawer" aria-hidden="true" />;
   }
 
   const date = item.savedAt || item.sentAt || item.importedAt;
@@ -678,12 +822,80 @@ function WatchTab({ item }) {
   );
 }
 
-function EmptyState({ onImport }) {
+function ImportReviewLayer({ pendingImport, selection, selectedCount, onToggleSaved, onToggleOther, onToggleMessage, onCancel, onContinue }) {
+  const saved = pendingImport.groups.saved;
+  const other = pendingImport.groups.other;
+  const messages = pendingImport.groups.messages;
+
+  return (
+    <div className="import-review-layer" role="dialog" aria-modal="true" aria-labelledby="import-review-title">
+      <div className="import-review-card">
+        <div className="modal-head">
+          <div>
+            <h2 id="import-review-title">Choose What To Import</h2>
+            <p>Review found reels before adding them to your library and starting AI review.</p>
+          </div>
+          <button className="icon-button" type="button" aria-label="Cancel import" onClick={onCancel}><X size={17} /></button>
+        </div>
+
+        <div className="import-review-summary">
+          <StatusMetric icon={CheckCircle2} label="Found" value={pendingImport.items.length} />
+          <StatusMetric icon={Bookmark} label="Saved" value={saved.count} />
+          <StatusMetric icon={Library} label="Other" value={other.count} />
+          <StatusMetric icon={Inbox} label="Message People" value={messages.length} />
+        </div>
+
+        <div className="import-choice-list">
+          <label className={`import-choice ${selection.saved ? "selected" : ""} ${saved.count ? "" : "disabled"}`}>
+            <input type="checkbox" checked={selection.saved} disabled={!saved.count} onChange={onToggleSaved} />
+            <Bookmark size={18} />
+            <span>
+              <strong>Saved reels</strong>
+              <small>{saved.count} reels from your saved export</small>
+            </span>
+          </label>
+
+          <label className={`import-choice ${selection.other ? "selected" : ""} ${other.count ? "" : "disabled"}`}>
+            <input type="checkbox" checked={selection.other} disabled={!other.count} onChange={onToggleOther} />
+            <Library size={18} />
+            <span>
+              <strong>Other export reels</strong>
+              <small>{other.count} reels from JSON/export backup files</small>
+            </span>
+          </label>
+
+          <div className="message-choice-head">
+            <strong>DM reels by person</strong>
+            <small>Select only the conversations you want to import.</small>
+          </div>
+
+          {messages.length ? messages.map((group) => (
+            <label key={group.account} className={`import-choice ${selection.messages.includes(group.account) ? "selected" : ""}`}>
+              <input type="checkbox" checked={selection.messages.includes(group.account)} onChange={() => onToggleMessage(group.account)} />
+              <Inbox size={18} />
+              <span>
+                <strong>{group.account}</strong>
+                <small>{group.count} reels found in messages</small>
+              </span>
+            </label>
+          )) : <p className="muted">No DM reels found in this import.</p>}
+        </div>
+
+        <div className="modal-actions">
+          <button className="secondary-button" type="button" onClick={onCancel}>Cancel</button>
+          <button className="primary-button" type="button" disabled={!selectedCount} onClick={onContinue}>Import {selectedCount} Reels</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EmptyState({ hasItems, onImport }) {
   return (
     <div className="empty-state">
       <UploadCloud size={32} />
-      <h2>No matching reels</h2>
-      <p>Import an Instagram ZIP/JSON export or broaden filters.</p>
+      <h2>{hasItems ? "No matching reels" : "No reels imported yet"}</h2>
+      <p>{hasItems ? "Broaden filters or search for a different topic." : "Import your Instagram ZIP or JSON export to build the library."}</p>
       <button className="primary-button" type="button" onClick={onImport}>Import Instagram Export</button>
     </div>
   );
@@ -729,3 +941,20 @@ function getInstagramEmbedUrl(url) {
 function mergeTags(a = [], b = []) {
   return [...new Set([...a, ...(b || [])].filter(Boolean))].slice(0, 8);
 }
+
+function filterPendingImportItems(pendingImport, selection) {
+  const selectedIds = new Set();
+  if (selection.saved) {
+    pendingImport.groups.saved.itemIds.forEach((id) => selectedIds.add(id));
+  }
+  if (selection.other) {
+    pendingImport.groups.other.itemIds.forEach((id) => selectedIds.add(id));
+  }
+  pendingImport.groups.messages
+    .filter((group) => selection.messages.includes(group.account))
+    .forEach((group) => group.itemIds.forEach((id) => selectedIds.add(id)));
+  return pendingImport.items.filter((item) => selectedIds.has(item.id));
+}
+
+
+
